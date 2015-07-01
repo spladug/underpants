@@ -73,6 +73,11 @@ type conf struct {
     Key string
   }
 
+  // A mapping of group names to lists of user email addresses that are members
+  // of that group.  If this section is present, then the default behaviour for
+  // a route is to deny all users not in a group on its allowed-groups list.
+  Groups map[string][]string
+
   // The mappings from hostname to backend server.
   Routes []struct {
 
@@ -84,6 +89,12 @@ type conf struct {
     // non-root (i.e. http://example.com/foo/bar/) URL, the path of the URL will be
     // discarded.
     To string
+
+    // A list of groups which may access this route.  If groups are configured,
+    // users who are not a member of one of these groups will be denied access.
+    // A special group, `*`, may be specified which allows any authenticated
+    // user.
+    AllowedGroups []string `json:"allowed-groups"`
   }
 }
 
@@ -91,6 +102,12 @@ type conf struct {
 // any certificates were included in the configuration.
 func (c *conf) HasCerts() bool {
   return len(c.Certs) > 0
+}
+
+// Used to determine if the instance is configured for more granular group-based access
+// control lists.
+func (c *conf) HasGroups() bool {
+  return len(c.Groups) > 0
 }
 
 // A convience method for getting the relevant scheme based on whether certificates were
@@ -196,6 +213,9 @@ type disp struct {
 
   // The OAuth configuration object needed for authentication.
   oauth *oauth.Config
+
+  // The groups which may access this backend.
+  groups []string
 }
 
 // Construct a URL to the oauth provider that with carry the provided URL as state
@@ -255,6 +275,31 @@ func serveHttpProxy(d *disp, w http.ResponseWriter, r *http.Request) {
       d.AuthCodeUrl(urlFor(d.config.Scheme(), d.host, r)),
       http.StatusFound)
     return
+  }
+
+  if d.config.HasGroups() {
+    authorized := false
+
+AuthCheck:
+    for _, group := range d.groups {
+      if group == "*" {
+        authorized = true
+        break AuthCheck
+      }
+
+      for _, allowedUser := range d.config.Groups[group] {
+        if u.Email == allowedUser {
+          authorized = true
+          break AuthCheck
+        }
+      }
+    }
+
+    if !authorized {
+      log.Printf("Denied %s access to %s", u.Email, d.host)
+      http.Error(w, "Forbidden: you are not a member of a group authorized to view this site.", 403)
+      return
+    }
   }
 
   br, err := http.NewRequest(r.Method, urlFor(d.route.scheme, d.route.host, r).String(), r.Body)
@@ -426,6 +471,7 @@ func setup(c *conf, port int) (*http.ServeMux, error) {
       host:   host,
       key:    key,
       oauth:  oc,
+      groups: r.AllowedGroups,
     }))
   }
 
